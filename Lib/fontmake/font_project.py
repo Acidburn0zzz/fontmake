@@ -50,6 +50,10 @@ timer = Timer(logging.getLogger('fontmake.timer'), level=logging.DEBUG)
 PUBLIC_PREFIX = 'public.'
 GLYPHS_PREFIX = 'com.schriftgestaltung.'
 
+TEMP_UFO_EXT = ".temp.ufo"
+TEMP_TTF_EXT = ".temp.ttf"
+FEATURES_FILE = "features.fea"
+
 
 class FontProject(object):
     """Provides methods for building fonts."""
@@ -270,6 +274,14 @@ class FontProject(object):
             name = self._font_name(ufo)
             logger.info('Saving %s for %s' % (ext.upper(), name))
 
+            # Copy the features.fea file from the original UFO master
+            if ufo.path.endswith(TEMP_UFO_EXT):
+                fea_file_path_from = os.path.join(
+                    ufo.path[:-len(TEMP_UFO_EXT)] + '.ufo', FEATURES_FILE)
+                fea_file_path_to = os.path.join(ufo.path, FEATURES_FILE)
+                if os.path.exists(fea_file_path_from):
+                    shutil.copyfile(fea_file_path_from, fea_file_path_to)
+
             otf_path = self._output_path(ufo, ext, is_instance, interpolatable)
             if use_production_names is None:
                 use_production_names = not ufo.lib.get(
@@ -298,6 +310,16 @@ class FontProject(object):
                 font['GSUB'] = gsub_src['GSUB']
 
             font.save(otf_path)
+
+            # Rename temp TTF (intermediate) master
+            if otf_path.endswith(TEMP_TTF_EXT):
+                new_path = otf_path[:-len(TEMP_TTF_EXT)] + '.ttf'
+                os.rename(otf_path, new_path)
+
+            # Remove temp UFO
+            if ufo.path.endswith(TEMP_UFO_EXT):
+                if os.path.exists(ufo.path):
+                    shutil.rmtree(ufo.path)
 
             if subset is None:
                 export_key = GLYPHS_PREFIX + 'Glyphs.Export'
@@ -489,6 +511,12 @@ class FontProject(object):
         if 'ttf-interpolatable' in output or 'variable' in output:
             if need_reload:
                 ufos = [Font(path) for path in ufo_paths]
+            # check if all the masters have the same set of glyphs
+            # (intermediate masters can have a subset of the glyphs)
+            glyph_sets = [set(font.keys()) for font in ufos]
+            if not all([gset == glyph_sets[0] for gset in glyph_sets]):
+                ufo_paths = self.generate_temp_masters(designspace_path)
+                ufos = [Font(path) for path in ufo_paths]
             self.build_interpolatable_ttfs(
                 ufos, reverse_direction, conversion_error, **kwargs)
 
@@ -496,6 +524,105 @@ class FontProject(object):
             if designspace_path is None:
                 raise TypeError('Need designspace to build variable font.')
             self.build_variable_font(designspace_path)
+
+    def generate_temp_masters(self, designspace_path):
+        """Makes a new designspace file and generates instances at the
+           same location as the masters that have a subset of the glyphset"""
+        from mutatorMath.ufo.document import DesignSpaceDocumentReader
+
+        logfile = tempfile.NamedTemporaryFile(delete=True).name
+        temp_ds_path, master_paths = self.build_temp_designspace(
+            designspace_path)
+        logger.info("Generating temp UFO master(s)...")
+        ds_doc_reader = DesignSpaceDocumentReader(
+            temp_ds_path, ufoVersion=2, roundGeometry=True,
+            verbose=False, logPath=logfile)
+        ds_doc_reader.process(makeGlyphs=True, makeKerning=True, makeInfo=True)
+        # Delete temp designspace file
+        if os.path.exists(temp_ds_path):
+            os.remove(temp_ds_path)
+        base_folder = os.path.dirname(os.path.abspath(designspace_path))
+        master_paths = [os.path.join(base_folder, p) for p in master_paths]
+        return master_paths
+
+    def build_temp_designspace(self, dsPath):
+        """'dsPath' is the path to the original designspace file.
+           Returns a modified designspace file (for generating temp UFO
+           masters) and a list of paths to the UFO masters (that will be used
+           for generating each master OTF).
+        """
+        try:
+            import xml.etree.cElementTree as ET
+        except ImportError:
+            import xml.etree.ElementTree as ET
+
+        XMLElement = ET.Element
+        xmlToString = ET.tostring
+
+        ds = ET.parse(dsPath).getroot()
+        masterList = ds.find('sources').findall('source')
+
+        # Delete the existing instances
+        instances = ds.find('instances')
+        ds.remove(instances)
+        ds.append(XMLElement('instances'))
+        instances = ds.find('instances')
+
+        # Don't be wasteful, generate only the necessary temp masters
+        master_list = ET.parse(dsPath).getroot().find('sources').findall(
+            'source')
+        temp_masters_to_generate = self._determine_which_masters_to_generate(
+            dsPath, master_list)
+
+        # Populate the <instances> element with the information needed
+        # for generating the temp master(s)
+        master_paths = []
+        for i, master in enumerate(masterList):
+            masterPath = master.attrib['filename']
+            if i not in temp_masters_to_generate:
+                master_paths.append(masterPath)
+                continue
+            instance = XMLElement('instance')
+            instance.append(master.find('location'))
+            instance.append(XMLElement('kerning'))
+            instance.append(XMLElement('info'))
+            tempMasterPath = os.path.splitext(masterPath)[0] + TEMP_UFO_EXT
+            master_paths.append(tempMasterPath)
+            instance.attrib['filename'] = tempMasterPath
+            ufo_path = os.path.join(os.path.dirname(dsPath), masterPath)
+            ufo_info = Font(ufo_path).info
+            instance.attrib['familyname'] = ufo_info.familyName
+            instance.attrib['stylename'] = ufo_info.styleName
+            instance.attrib['postscriptfontname'] = ufo_info.postscriptFontName
+            instances.append(instance)
+        tempDSPath = os.path.splitext(dsPath)[0] + ".temp.designspace"
+        fp = open(tempDSPath, "wt")
+        fp.write(xmlToString(ds))
+        fp.close()
+        return tempDSPath, master_paths
+
+    def _determine_which_masters_to_generate(self, ds_path, master_list):
+        """'ds_path' is the path to a designspace file.
+           Returns a list of integers representing the indexes
+           of the temp masters to generate.
+        """
+        # Make a set of the glyphsets of all the masters while collecting each
+        # glyphset. Glyph order is ignored.
+        all_gsets = set()
+        each_gset = []
+        for master in master_list:
+            master_path = master.attrib['filename']
+            ufo_path = os.path.join(os.path.dirname(ds_path), master_path)
+            gset = set(Font(ufo_path).keys())
+            all_gsets.update(gset)
+            each_gset.append(gset)
+
+        master_indexes = []
+        for i, gset in enumerate(each_gset):
+            if gset != all_gsets:
+                master_indexes.append(i)
+
+        return master_indexes
 
     def _font_name(self, ufo):
         """Generate a postscript-style font name."""
