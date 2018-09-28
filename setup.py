@@ -159,7 +159,7 @@ with open('README.rst', 'r', encoding='utf-8') as f:
 
 setup(
     name="fontmake",
-    version="1.4.0",
+    version="1.4.0.adobe_fork",
     description=("Compile fonts from sources (UFO, Glyphs) to binary "
                  "(OpenType, TrueType)."),
     long_description=long_description,
@@ -175,9 +175,9 @@ setup(
     setup_requires=wheel + bump2version,
     install_requires=[
         "fonttools>=3.21.2",
-        "cu2qu>=1.3.0",
-        "glyphsLib>=2.2.1",
-        "ufo2ft>=1.1.0",
+        "cu2qu>=1.4.0",
+        "glyphsLib==2.2.1",
+        "ufo2ft==1.1.0",
         "MutatorMath>=2.1.0",
         "defcon>=0.3.5",
         "booleanOperations>=0.8.0",
